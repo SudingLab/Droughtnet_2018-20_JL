@@ -46,6 +46,8 @@ library(ggExtra)
 library(car)
 library(GGally)
 library(ggcorrplot)
+library(ggpubr)
+library(cowplot)
 #library(Hmisc)
 #library(gridExtra)
 
@@ -96,7 +98,8 @@ exclude_species <- c("cow", "rock",   # non-plant objects,
                      "uk", "ukf", "ukg", "unk", "f", "uk1")  
 comp <- comp_raw %>%
   mutate(across(c(year, block, plot, species_clean), as.factor)) %>%
-  filter(!species_clean %in% exclude_species)
+  filter(!species_clean %in% exclude_species) %>% 
+  filter(!is.na(species_clean))
 
 #'check this has worked 
 unique(comp$species_clean)
@@ -120,9 +123,13 @@ comp_wide <- comp %>%
   summarise(cover = sum(area_clipped, na.rm = TRUE), .groups = "drop") %>%
   pivot_wider(names_from = species_clean, values_from = cover, values_fill = 0)
 
+#write.csv(comp_wide, 'Data/plant_comp_wide_18_25.csv')
+
 #' Revised long matrix of total species cover
 comp_long <- comp_wide %>%
   pivot_longer(cols = -c(year, block, plot), names_to = "species clean", values_to = "cover")
+
+#write.csv(comp_long, 'Data/plant_comp_long_18_25.csv')
 
 #' Create info dataframe sorted by year, block, plot and 
 #' year and block as factors + reference levels for fixed effects
@@ -184,12 +191,46 @@ comp_dat_long %>%
   select(species, rel_cov) %>%
   summarise(total = sum(rel_cov))  # should sum to ~1
 
+#' 
+#' *Gathering Weather Data From NLR Station*
+#' **Load data**
+#'
+
+#' read in files
+#' filter out NA and trace codes
+#' make columns for experimental plots (wet and dry treatments)
+precipData <- read.csv(paste0(wdpath, "Data/BoulderDailyWeather.csv")) %>% 
+  rename(year = Year, month = Month, day = Day) %>% 
+  filter(precip != -998.00, precip != -999.00) %>% 
+  mutate(month = as.numeric(unlist(month)),
+         precip_cm = as.numeric(unlist(precip)) * 2.54) %>% 
+  mutate(drought_cm = if_else(month %in% 5:9, precip_cm * 0.67, NA_real_),
+         wet_cm = if_else(month %in% 5:9, precip_cm * 1.67, NA_real_)) 
+
+#' match calculated experimental rain treatments to rain_trt codes
+#' focus on experimental period May - September
+precipData_long <- precipData %>%
+  select(-precip) %>% # Drops the original raw column
+  pivot_longer(cols = c(precip_cm, drought_cm, wet_cm),
+               names_to = "rain_trt", values_to = "precip") %>%
+  mutate(rain_trt = case_match(rain_trt, "precip_cm" ~ "C", "drought_cm" ~ "D", "wet_cm" ~ "W", .default = rain_trt)) %>% 
+  filter(month %in% 5:9) 
+
+#' sum total of precip per growing year
+precip_annual <- precipData_long %>%
+  filter(year %in% 2018:2025) %>% 
+  filter(month %in% 5:9) %>% 
+  group_by(year, rain_trt) %>%
+  summarise(total_precip = sum(precip, na.rm = TRUE), .groups = "drop") %>%
+  mutate(rain_trt = factor(rain_trt, levels = c("D", "C", "W")))
+
+
 #'
 #' *Estimate composition metrics*
 #' *1. Richness, Evenness, & Shannon Diversity* 
 #' 
 
-#' Step 1: calculate diversity metrics
+#' *Step 1: calculate diversity metrics*
 structure_sqrt <- community_structure(comp_dat_long, time.var = "year", replicate.var = "b_p", abundance.var = "rel_cov")
 div_sqrt <- community_diversity(comp_dat_long, time.var = "year", replicate.var = "b_p", abundance.var = "rel_cov")
 
@@ -220,20 +261,27 @@ structure_sum_sqrt <- structure_raw_sqrt %>%
 #' Format dataframes for analysis
 #' Create several sets of unique treatment contrasts for models
 #' 
+#' *artefacts from Julie - probably not using this stepwise contrast method in 2026*
 #' Function for creating contrasts
-set_contrasts <- function(df, year_ref, rain_ref, graze_ref) {
-  df %>% mutate(year = fct_relevel(year, year_ref),
-                rain_trt  = fct_relevel(rain_trt, rain_ref),
-                graze_trt = fct_relevel(graze_trt, graze_ref))
-  }
+#set_contrasts <- function(df, year_ref, rain_ref, graze_ref) {
+ # df %>% mutate(year = fct_relevel(year, year_ref),
+  #              rain_trt  = fct_relevel(rain_trt, rain_ref),
+   #             graze_trt = fct_relevel(graze_trt, graze_ref))
+#  }
 
 #' Control rain as reference ("does drought/wet differ from ambient?")
-  structure_con <- set_contrasts(structure_all_sqrt, "2018", "C", "C")
+  #structure_con <- set_contrasts(structure_all_sqrt, "2018", "C", "C")
 #' Drought as reference ("does control/wet differ from drought?")
-  structure_dry <- set_contrasts(structure_all_sqrt, "2018", "D", "C")
+  #structure_dry <- set_contrasts(structure_all_sqrt, "2018", "D", "C")
 #' Wet as reference ("does control/drought differ from wet?")
-  structure_wet <- set_contrasts(structure_all_sqrt, "2018", "W", "C")
+  #structure_wet <- set_contrasts(structure_all_sqrt, "2018", "W", "C")
   
+#' join precipitation into composition dataframe
+structure_precip <- structure_raw_sqrt %>%
+  mutate(year_num = as.numeric(as.character(year))) %>%
+  left_join(precip_annual, by = c("rain_trt", "year_num" = "year")) %>% 
+  mutate(rain_trt = factor(rain_trt, levels = c("D", "C", "W")))
+
 #'
 #' *2. Functional Groups* 
 #' 
@@ -278,7 +326,7 @@ comp_dat_long_fungrp <- comp_dat_long %>%
   fungrp_dry <- set_contrasts(fungrp_df, "2018", "D", "C")  # drought reference
   fungrp_wet <- set_contrasts(fungrp_df, "2018", "W", "C")  # wet reference
   
-#' Step 6: filter and scale by functional group using a function instead of 16 objects
+#' Step 6: filter and scale by functional group using a function
   scale_fungrp <- function(df, grp) {
     df %>%
       filter(fun_grp == grp) %>%
@@ -291,10 +339,6 @@ comp_dat_long_fungrp <- comp_dat_long %>%
   g_c3 <- scale_fungrp(fungrp_con, "G_C3")
   ann  <- scale_fungrp(fungrp_con, "G_A-BI")
   f    <- scale_fungrp(fungrp_con, "F")
-  
-#' If you need different contrasts for a specific model, just filter inline:
-  scale_fungrp(fungrp_dry, "G_C4")  # drought reference for C4 grasses
-  scale_fungrp(fungrp_wet, "G_C3")  # wet reference for C3 grasses 
   
 #' 
 #' *Combined Community Metrics Dataframe*
@@ -333,15 +377,6 @@ comp_dat_long_fungrp <- comp_dat_long %>%
   
   community_sum_mean <- community_sum_mean %>%
     left_join(year_seq, by = c("year", "graze_trt"))
-  
-#' ###########
-#' Step 4: filter inline when needed
-  # e.g. for C3 grasses:
-  #community_sum_mean %>% 
-    #filter(metric == "G_C3") %>%
-    #left_join(community_sum_se %>% select(year, rain_trt, graze_trt, se = G_C3),
-     #         by = c("year", "rain_trt", "graze_trt"))
-  # OR keep combined and use facet_wrap(~metric) in ggplot 
 
 #'
 #' **ANALYSIS: Species composition**
@@ -428,14 +463,16 @@ arrow_segments <- map_dfr(seq_along(all_years[-length(all_years)]), function(i) 
   yr1 <- all_years[i]
   yr2 <- all_years[i + 1]
   plot_scores_trajectories %>%
-  mutate(rain_trt = factor(rain_trt, levels = c("D", "C", "W"))) %>% 
+    mutate(rain_trt = factor(rain_trt, levels = c("D", "C", "W"))) %>%
     transmute(block, plot, graze_trt, rain_trt,
               MDS1_start = .data[[paste0("MDS1_", yr1)]],
               MDS2_start = .data[[paste0("MDS2_", yr1)]],
               MDS1_end   = .data[[paste0("MDS1_", yr2)]],
               MDS2_end   = .data[[paste0("MDS2_", yr2)]],
               year_from  = yr1, year_to = yr2)
-})
+}) %>%
+  filter(!is.na(MDS1_start) & !is.na(MDS1_end) &   # remove missing segments
+           !is.na(MDS2_start) & !is.na(MDS2_end))
 
 # Geom_segment for all years
 geom_segment(aes(x = MDS1_start, xend = MDS1_end,
@@ -506,7 +543,6 @@ ggsave(fig_nmds_species, filename = paste0(wdpath, "Figures26/fig_nmds_species.j
 #'  --Forbs
 #'  
 
-
 #'  *Shannon Diversity*
 #'  
 
@@ -527,50 +563,34 @@ structure_all_sqrt %>%
   facet_grid(year ~ graze_trt, scales = "free") +
   theme_bw()
 
-#' Step 2: run models using contrast sets from set_contrasts() function
-div_mod_con <- lmer(shan ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = structure_con)
-div_mod_dry <- lmer(shan ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = structure_dry)
-div_mod_wet <- lmer(shan ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = structure_wet)
+#' run linear mixed models for shannon diversity 
+#' using rain_trt as a category
+div_mod_cat <- lmer(shan ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = structure_all_sqrt)
+  div_cat_means <- emmeans(div_mod_cat, specs = c("rain_trt", "graze_trt", "year")) 
+  div_cat_contrasts <- div_cat_means %>% 
+    contrast(method = 'pairwise', by = c("graze_trt", "year"), adjust = "none")
+  
+#' using total precip cm 
+div_mod_precip <- lmer(shan ~ total_precip * graze_trt * year + (1|block) + (1|b_p), data = structure_precip)
+summary(div_mod_precip)
 
 #' Check residuals
-plot(div_mod_con)
-qqnorm(residuals(div_mod_con))
+plot(div_mod_cat)
+qqnorm(residuals(div_mod_cat))
 
 #' Model summary
-anova(div_mod_con)
-r2(div_mod_con)
-summary(div_mod_con)
-
-#' Step 3: extract fixed effects 
-extract_fixef <- function(model, response_name) {
-  fix <- data.frame(round(fixef(model), 4)) %>%
-    rename(fixef = 1) %>%
-    rownames_to_column("term")
-  ci <- data.frame(round(confint(model), 4)) %>%
-    rownames_to_column("term")
-  left_join(fix, ci, by = "term") %>%
-    mutate(response = response_name)
-}
-
-#' Apply to each contrast set and combine
-div_fixef_all <- bind_rows(
-  extract_fixef(div_mod_con, "div"),
-  extract_fixef(div_mod_dry, "div"),
-  extract_fixef(div_mod_wet, "div")
-) %>%
-  distinct() %>%
-  arrange(term)
+anova(div_mod_cat)
+r2(div_mod_cat)
+summary(div_mod_cat)
 
 #' Step 4: Shannon diversity figure - generalized for any years
 all_years <- sort(unique(structure_sum_sqrt$year))
 
 structure_sum_div <- structure_sum_sqrt %>%
   filter(metric == "Diversity") %>%
-  mutate(
-    graze_trt = factor(graze_trt, levels = c("Ungrazed", "Fall Graze", "Spring Graze")),
-    rain_trt  = factor(rain_trt, levels = c("D", "C", "W")),
-    year      = as.numeric(as.character(year))
-  )
+  mutate(graze_trt = factor(graze_trt, levels = c("Ungrazed", "Fall Graze", "Spring Graze")),
+         rain_trt  = factor(rain_trt, levels = c("D", "C", "W")),
+         year      = as.numeric(as.character(year)))
 
 fig_div <- ggplot(structure_sum_div, aes(x = year, y = mean, col = rain_trt, shape = graze_trt)) +
   geom_point(size = 2.5, alpha = 0.8, position = position_dodge(0.3)) +
@@ -578,10 +598,10 @@ fig_div <- ggplot(structure_sum_div, aes(x = year, y = mean, col = rain_trt, sha
                 linewidth = 1, width = 0, alpha = 0.45,
                 position = position_dodge(0.3)) +
   scale_x_continuous(breaks = all_years, limits = c(min(all_years) - 0.25, max(all_years) + 0.25)) +         
-  scale_color_manual(values = c("#d7191c", "#8856a7", "#2c7bb6")) +
-  scale_fill_manual(values = c("#d7191c", "#8856a7", "#2c7bb6")) +
-  labs(x = "Year", y = "Shannon Diversity",
-       col = "Rain trt.", shape = "Graze trt.") +
+  scale_color_manual(values = c("#d7191c", "tan", "#2c7bb6"), labels = c("Drought", "Control", "Wet"), name = "Rain Treatment") +
+  scale_shape_manual(values = c(16, 17, 15), labels = c("Ungrazed", "Fall Graze", "Spring Graze"), name = "Graze Treatment") +
+  labs(x = "Year", y = "Shannon Diversity", col = "Rain Treatment", shape = "Graze Treatment") +
+  ggtitle("Shannon Diversity", subtitle = "Rain x Graze Treatments") +
   facet_wrap(~graze_trt) +
   theme_bw() +
   theme(legend.position = "right",
@@ -593,6 +613,67 @@ fig_div <- ggplot(structure_sum_div, aes(x = year, y = mean, col = rain_trt, sha
 fig_div
 ggsave(fig_div, filename = paste0(wdpath, "Figures26/fig_div.jpg"),
        device = "jpeg", height = 4.64, width = 6.5, units = "in")
+
+#' LMM predicted values from coninuous rainfall model
+div_precip_pred <- ggpredict(div_mod_precip, terms = c("total_precip [all]", "graze_trt"))
+
+pred_div_df <- as.data.frame(div_precip_pred) %>%
+  mutate(graze_trt = fct_recode(as.character(group), "Ungrazed" = "C", "Fall Graze" = "FG", "Spring Graze" = "SG"))
+
+slope_df <- slope_df %>%
+  mutate(graze_trt = fct_recode(as.character(graze_trt),"Ungrazed" = "C", "Fall Graze" = "FG", "Spring Graze" = "SG"),
+         label = paste0("Slope: ", round(total_precip.trend, 3), "\np = ", round(as.data.frame(test(slopes))$p.value, 3)))
+
+#' extract slope and p values for lmm
+div_trends <- emtrends(div_mod_precip, ~ graze_trt, var = "total_precip")
+
+stats_div_df <- as.data.frame(test(div_trends)) %>%
+  mutate(graze_trt = fct_recode(as.character(graze_trt), "Ungrazed" = "C", "Fall Graze" = "FG", "Spring Graze" = "SG"),
+    stars = case_when(p.value < 0.001 ~ "***", p.value < 0.01 ~ "**", p.value < 0.05 ~ "*", TRUE ~ "ns"),
+    label = paste0("beta == ", round(total_precip.trend, 3), "~('", stars, "')"))
+
+#' extract R2 values from model
+model_r2 <- r2(div_mod_precip)
+m_r2 <- round(model_r2$R2_marginal, 3)
+c_r2 <- round(model_r2$R2_conditional, 3)
+
+r2_label <- paste0("Marginal ~ R^2 == ", m_r2, " * ',' ~ Conditional ~ R^2 == ", c_r2)
+
+#' plot LMM trend line and raw data 
+fig_div_precip <- ggplot() +
+  # Raw data points
+  geom_point(data = structure_precip %>%  
+               mutate(graze_trt = fct_recode(as.character(graze_trt), "Ungrazed" = "C", "Fall Graze" = "FG", "Spring Graze" = "SG")),
+             aes(x = total_precip, y = shan, col = rain_trt, shape = graze_trt), alpha = 0.8, size = 2.5) +
+  geom_ribbon(data = pred_div_df, aes(x = x, ymin = conf.low, ymax = conf.high, fill = graze_trt), alpha = 0.15) +
+  geom_line(data = pred_div_df, aes(x = x, y = predicted, group = graze_trt), color = "black", linewidth = 1.2) +
+  scale_color_manual(values = c("#d7191c", "tan", "#2c7bb6"), labels = c("Drought", "Control", "Wet"), name = "Rain Treatment") +
+  scale_shape_manual(values = c(16, 17, 15), labels = c("Ungrazed", "Fall Graze", "Spring Graze"), name = "Graze Treatment") +
+  scale_fill_manual(values = c("Ungrazed" = "darkgreen", "Fall Graze" = "orange", "Spring Graze" = "purple"), 
+                    labels = c("Ungrazed", "Fall Graze", "Spring Graze"), name = "Graze Treatment") +
+  labs(x = "Total Growing Season Precipitation (cm)", y = "Shannon Diversity", col = "Rain Treatment", shape = "Graze Treatment") +
+  ggtitle("Shannon Diversity", subtitle = "Total Precipitation (cm)") +
+  facet_wrap(~graze_trt) +
+  geom_text(data = stats_div_df, aes(x = 60, y = 3.1, label = label), parse = TRUE, size = 4) +
+  annotate("text", x = Inf, y = -Inf, label = r2_label, parse = TRUE, hjust = 1.1, vjust = -1.5, size = 2.5, fontface = "italic") +
+  theme_bw() +
+  theme(legend.position = "right",
+        panel.grid.minor = element_blank())
+
+#' view and save
+fig_div_precip
+ggsave(fig_div_precip, filename = paste0(wdpath, "Figures26/fig_div_precip.jpg"),
+       device = "jpeg", height = 4.5, width = 7, units = "in")
+
+#' Combined figure: Shannon Diversity organized two ways 
+fig_combined_div <- (fig_div / fig_div_precip) +
+  plot_annotation(title = "Shannon Diversity", subtitle = "By rain treatment and total precipitation (cm)", tag_levels = "A") + 
+  plot_layout(guides = "collect", axis_titles = "collect")
+
+#' view and save
+fig_combined_div
+ggsave(fig_combined_div, filename = paste0(wdpath, "Figures26/fig_combined_div.jpg"),
+       device = "jpeg", height = 10, width = 10, units = "in")
 
 #'  
 #'  * Richness *
@@ -613,27 +694,25 @@ structure_all_sqrt %>%
   facet_grid(year ~ graze_trt, scales = "free") +
   theme_bw()
 
-#' Model - using named contrast sets
-rich_mod_con <- lmer(rich ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = structure_con)
-rich_mod_dry <- lmer(rich ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = structure_dry)
-rich_mod_wet <- lmer(rich ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = structure_wet)
+#' run linear mixed models for richness 
+#' using rain_trt as a category
+rich_mod_cat <- lmer(rich ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = structure_all_sqrt)
+  rich_cat_means <- emmeans(rich_mod_cat, specs = c("rain_trt", "graze_trt", "year")) 
+  rich_cat_contrasts <- rich_cat_means %>% 
+  contrast(method = 'pairwise', by = c("graze_trt", "year"), adjust = "none")
+  
+#' using total precip cm 
+rich_mod_precip <- lmer(rich ~ total_precip * graze_trt * year + (1|block) + (1|b_p), data = structure_precip) 
+summary(rich_mod_precip)
 
 #' Check residuals
-plot(rich_mod_con)
-qqnorm(residuals(rich_mod_con))
+plot(rich_mod_cat)
+qqnorm(residuals(rich_mod_cat))
 
 #' Model summaries
-anova(rich_mod_con)
-r2(rich_mod_con)
-summary(rich_mod_con)
-
-#' Extract fixed effects
-rich_fixef_all <- bind_rows(
-  extract_fixef(rich_mod_con, "rich"),
-  extract_fixef(rich_mod_dry, "rich"),
-  extract_fixef(rich_mod_wet, "rich")) %>%
-  distinct() %>%
-  arrange(term)
+anova(rich_mod_cat)
+r2(rich_mod_cat)
+summary(rich_mod_cat)
 
 #' Richness Figure - generalized for all years
 structure_sum_rich <- structure_sum_sqrt %>%
@@ -648,7 +727,7 @@ fig_rich <- ggplot(structure_sum_rich, aes(x = year, y = mean, col = rain_trt, s
                 linewidth = 1, width = 0, alpha = 0.45,         
                 position = position_dodge(0.35)) +
   scale_x_continuous(breaks = all_years, limits = c(min(all_years) - 0.25, max(all_years) + 0.25)) +
-  scale_color_manual(values = c("#d7191c", "#8856a7", "#2c7bb6"), labels = c("Drought", "Control", "Wet")) +
+  scale_color_manual(values = c("#d7191c", "tan", "#2c7bb6"), labels = c("Drought", "Control", "Wet")) +
   scale_shape_manual(values = c(16, 17, 15), labels = c("Ungrazed", "Fall Graze", "Spring Graze")) +
   labs(x = "Year", y = "Species Richness", col = "Rain Treatment", shape = "Graze Treatment") +
   facet_wrap(~graze_trt) +
@@ -663,11 +742,68 @@ fig_rich
 ggsave(fig_rich, filename = paste0(wdpath, "Figures26/fig_rich.jpg"),
        device = "jpeg", height = 4.64, width = 6.5, units = "in")
 
+#' Richness and total precip figure
+#' LMM predicted values from coninuous rainfall model
+rich_precip_pred <- ggpredict(rich_mod_precip, terms = c("total_precip [all]", "graze_trt"))
+
+pred_rich_df <- as.data.frame(rich_precip_pred) %>%
+  mutate(graze_trt = fct_recode(as.character(group), "Ungrazed" = "C", "Fall Graze" = "FG", "Spring Graze" = "SG"))
+
+stats_rich_df <- emtrends(rich_mod_precip, ~ graze_trt, var = "total_precip") %>%
+  test() %>%           
+  as.data.frame() %>%  
+  mutate(graze_trt = fct_recode(as.character(graze_trt), "Ungrazed" = "C", "Fall Graze" = "FG", "Spring Graze" = "SG"),
+         stars = case_when(p.value < 0.001 ~ "***", p.value < 0.01 ~ "**", p.value < 0.05  ~ "*", TRUE ~ "ns"),
+         label = paste0("beta == ", round(total_precip.trend, 3), "~('", stars, "')"))
+
+#' extract R2 values from model
+model_r2 <- r2(rich_mod_precip)
+m_r2 <- round(model_r2$R2_marginal, 3)
+c_r2 <- round(model_r2$R2_conditional, 3)
+
+r2_label <- paste0("Marginal ~ R^2 == ", m_r2, " * ',' ~ Conditional ~ R^2 == ", c_r2)
+
+#' plot LMM trend line and raw data 
+fig_rich_precip <- ggplot() +
+  # Raw data points
+  geom_point(data = structure_precip %>% 
+               mutate(graze_trt = fct_recode(as.character(graze_trt), "Ungrazed" = "C", "Fall Graze" = "FG", "Spring Graze" = "SG")),
+             aes(x = total_precip, y = rich, col = rain_trt, shape = graze_trt), alpha = 0.8, size = 2.5) +
+  geom_ribbon(data = pred_rich_df, aes(x = x, ymin = conf.low, ymax = conf.high, fill = graze_trt), alpha = 0.15) +
+  geom_line(data = pred_rich_df, aes(x = x, y = predicted, group = graze_trt), color = "black", linewidth = 1.2) +
+  scale_color_manual(values = c("#d7191c", "tan", "#2c7bb6"), labels = c("Drought", "Control", "Wet"), name = "Rain Treatment") +
+  scale_shape_manual(values = c(16, 17, 15), labels = c("Ungrazed", "Fall Graze", "Spring Graze"), name = "Graze Treatment") +
+  scale_fill_manual(values = c("Ungrazed" = "darkgreen", "Fall Graze" = "orange", "Spring Graze" = "purple"), 
+                    labels = c("Ungrazed", "Fall Graze", "Spring Graze"), name = "Graze Treatment") +
+  labs(x = "Total Growing Season Precipitation (cm)", y = "Richness", col = "Rain Treatment", shape = "Graze Treatment") +
+  ggtitle("Richness", subtitle = "Total Precipitation (cm)") +
+  #coord_cartesian(ylim = c(0, 1)) +
+  facet_wrap(~graze_trt) +
+  geom_text(data = stats_even_df, aes(x = 60, y = 30, label = label), parse = TRUE, size = 4) +
+  annotate("text", x = Inf, y = -Inf, label = r2_label, parse = TRUE, hjust = 1.1, vjust = -1.5, size = 2.5, fontface = "italic") +
+  theme_bw() +
+  theme(legend.position = "right", panel.grid.minor = element_blank())
+
+#' view and save
+fig_rich_precip
+ggsave(fig_rich_precip, filename = paste0(wdpath, "Figures26/fig_rich_precip.jpg"),
+       device = "jpeg", height = 4.5, width = 7, units = "in")
+
+#' Combined figure: Richness organized two ways 
+fig_combined_rich <- (fig_rich / fig_rich_precip) +
+  plot_annotation(title = "Richness", subtitle = "By rain treatment and total precipitation (cm)", tag_levels = "A") + 
+  plot_layout(guides = "collect", axis_titles = "collect")
+
+#' view and save
+fig_combined_rich
+ggsave(fig_combined_rich, filename = paste0(wdpath, "Figures26/fig_combined_rich.jpg"),
+       device = "jpeg", height = 10, width = 10, units = "in")
+
 #'  
 #'  * Evenness *
 #'  
 
-#' Distribution check - inline
+#' Distribution check 
 structure_raw_sqrt %>%
   mutate(graze_trt = fct_recode(as.character(graze_trt), "Ungrazed" = "C", "Fall Graze" = "FG", "Spring Graze" = "SG"),
     rain_trt  = factor(rain_trt, levels = c("D", "C", "W"))) %>%
@@ -680,26 +816,25 @@ structure_raw_sqrt %>%
   facet_grid(year ~ graze_trt, scales = "free") +
   theme_bw()
 
-#' Models
-even_mod_con <- lmer(even ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = structure_con)
-even_mod_dry <- lmer(even ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = structure_dry)
-even_mod_wet <- lmer(even ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = structure_wet)
+#' run linear mixed models for evenness 
+#' using rain_trt as a category
+even_mod_cat <- lmer(even ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = structure_all_sqrt)
+  even_cat_means <- emmeans(even_mod_cat, specs = c("rain_trt", "graze_trt", "year")) 
+  even_cat_contrasts <- even_cat_means %>% 
+    contrast(method = 'pairwise', by = c("graze_trt", "year"), adjust = "none")
+
+#' using total precip cm
+even_mod_precip <- lmer(even ~ total_precip * graze_trt * year + (1|block) + (1|b_p), data = structure_precip) 
+summary(even_mod_precip)
 
 #' Check residuals
-plot(even_mod_con)
-qqnorm(residuals(even_mod_con))
+plot(even_mod_cat)
+qqnorm(residuals(even_mod_cat))
 
 #' Model summaries
-anova(even_mod_con)
-r2(even_mod_con)
-summary(even_mod_con)
-
-#' Fixed effects
-even_fixef_all <- bind_rows(extract_fixef(even_mod_con, "even"),
-  extract_fixef(even_mod_dry, "even"),
-  extract_fixef(even_mod_wet, "even")) %>%
-  distinct() %>%
-  arrange(term)
+anova(even_mod_cat)
+r2(even_mod_cat)
+summary(even_mod_cat)
 
 #' Evenness Figure
 structure_sum_even <- structure_sum_sqrt %>%
@@ -714,12 +849,12 @@ fig_even <- ggplot(structure_sum_even, aes(x = year, y = mean, col = rain_trt, s
       factor(levels = c("Ungrazed", "Fall Graze", "Spring Graze")),
       rain_trt = factor(rain_trt, levels = c("D", "C", "W")), year = as.numeric(as.character(year))),
              aes(x = year, y = even, col = rain_trt, shape = graze_trt),
-             alpha = 0.15, size = 1, position = position_dodge(0.3)) +
+             alpha = 0.15, size = 1, position = position_dodge(0.3), show.legend = FALSE) +
   # Means
   geom_point(size = 2.5, alpha = 0.8, position = position_dodge(0.3)) +
   geom_errorbar(aes(ymin = mean - se, ymax = mean + se), linewidth = 1, width = 0, alpha = 0.45, position = position_dodge(0.3)) +
   scale_x_continuous(breaks = all_years, limits = c(min(all_years) - 0.25, max(all_years) + 0.25)) +
-  scale_color_manual(values = c("#d7191c", "#8856a7", "#2c7bb6"), labels = c("Drought", "Control", "Wet")) +
+  scale_color_manual(values = c("#d7191c", "tan", "#2c7bb6"), labels = c("Drought", "Control", "Wet")) +
   scale_shape_manual(values = c(16, 17, 15), labels = c("Ungrazed", "Fall Graze", "Spring Graze")) +
   labs(x = "Year", y = "Species Evenness", col = "Rain Treatment", shape = "Graze Treatment") +
   facet_wrap(~graze_trt) +
@@ -734,6 +869,77 @@ fig_even <- ggplot(structure_sum_even, aes(x = year, y = mean, col = rain_trt, s
 fig_even
 ggsave(fig_even, filename = paste0(wdpath, "Figures26/fig_even.jpg"),
        device = "jpeg", height = 4.64, width = 6.5, units = "in")
+
+#' Evenness and total precip figure
+#' LMM predicted values from coninuous rainfall model
+even_precip_pred <- ggpredict(even_mod_precip, terms = c("total_precip [all]", "graze_trt"))
+
+pred_even_df <- as.data.frame(even_precip_pred) %>%
+  mutate(graze_trt = fct_recode(as.character(group), "Ungrazed" = "C", "Fall Graze" = "FG", "Spring Graze" = "SG"))
+
+stats_even_df <- emtrends(even_mod_precip, ~ graze_trt, var = "total_precip") %>%
+  test() %>%           
+  as.data.frame() %>%  
+  mutate(graze_trt = fct_recode(as.character(graze_trt), "Ungrazed" = "C", "Fall Graze" = "FG", "Spring Graze" = "SG"),
+         stars = case_when(p.value < 0.001 ~ "***", p.value < 0.01 ~ "**", p.value < 0.05  ~ "*", TRUE ~ "ns"),
+         label = paste0("beta == ", round(total_precip.trend, 3), "~('", stars, "')"))
+
+#' extract R2 values from model
+model_r2 <- r2(even_mod_precip)
+m_r2 <- round(model_r2$R2_marginal, 3)
+c_r2 <- round(model_r2$R2_conditional, 3)
+
+r2_label <- paste0("Marginal ~ R^2 == ", m_r2, " * ',' ~ Conditional ~ R^2 == ", c_r2)
+
+#' plot LMM trend line and raw data 
+fig_even_precip <- ggplot() +
+  # Raw data points
+  geom_point(data = structure_precip %>% 
+               mutate(graze_trt = fct_recode(as.character(graze_trt), "Ungrazed" = "C", "Fall Graze" = "FG", "Spring Graze" = "SG")),
+             aes(x = total_precip, y = even, col = rain_trt, shape = graze_trt), alpha = 0.8, size = 2.5) +
+  geom_ribbon(data = pred_even_df, aes(x = x, ymin = conf.low, ymax = conf.high, fill = graze_trt), alpha = 0.15) +
+  geom_line(data = pred_even_df, aes(x = x, y = predicted, group = graze_trt), color = "black", linewidth = 1.2) +
+  scale_color_manual(values = c("#d7191c", "tan", "#2c7bb6"), labels = c("Drought", "Control", "Wet"), name = "Rain Treatment") +
+  scale_shape_manual(values = c(16, 17, 15), labels = c("Ungrazed", "Fall Graze", "Spring Graze"), name = "Graze Treatment") +
+  scale_fill_manual(values = c("Ungrazed" = "darkgreen", "Fall Graze" = "orange", "Spring Graze" = "purple"), 
+                    labels = c("Ungrazed", "Fall Graze", "Spring Graze"), name = "Graze Treatment") +
+  labs(x = "Total Growing Season Precipitation (cm)", y = "Evenness", col = "Rain Treatment", shape = "Graze Treatment") +
+  ggtitle("Evenness", subtitle = "Total Precipitation (cm)") +
+  coord_cartesian(ylim = c(0, 1)) +
+  facet_wrap(~graze_trt) +
+  geom_text(data = stats_even_df, aes(x = 60, y = 0.95, label = label), parse = TRUE, size = 4) +
+  annotate("text", x = Inf, y = -Inf, label = r2_label, parse = TRUE, hjust = 1.1, vjust = -1.5, size = 2.5, fontface = "italic") +
+  theme_bw() +
+  theme(legend.position = "right", panel.grid.minor = element_blank())
+
+#' view and save
+fig_even_precip
+ggsave(fig_even_precip, filename = paste0(wdpath, "Figures26/fig_even_precip.jpg"),
+       device = "jpeg", height = 4.5, width = 7, units = "in")
+
+#' Combined figure: Evenness organized two ways 
+fig_combined_even <- (fig_even / fig_even_precip) +
+  plot_annotation(title = "Evenness", subtitle = "By rain treatment and total precipitation (cm)", tag_levels = "A") + 
+  plot_layout(guides = "collect", axis_titles = "collect")
+
+#' view and save
+fig_combined_even
+ggsave(fig_combined_even, filename = paste0(wdpath, "Figures26/fig_combined_even.jpg"),
+       device = "jpeg", height = 10, width = 10, units = "in")
+
+#' 
+#' *Combined figure for diversity, richness, and evenness*
+
+#' Combined figure: diversity richness, evenness, 
+fig_combined_dre <- (fig_div / fig_rich / fig_even) +
+  plot_annotation(title = "Community Structure Metrics", tag_levels = "A") + 
+  plot_layout(guides = "collect", axis_titles = "collect")
+
+#' view and save
+fig_combined_dre
+ggsave(fig_combined_dre, filename = paste0(wdpath, "Figures26/fig_combined_dre.jpg"),
+       device = "jpeg", height = 10, width = 10, units = "in")
+
 
 #'  
 #'  * C4 grasses *
@@ -753,27 +959,24 @@ scale_fungrp(fungrp_con, "G_C4") %>%
   facet_grid(year ~ graze_trt, scales = "free") +
   theme_bw()
 
-#' Models - using named contrast sets
-c4_mod_con <- lmer(fungrp_cov ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = scale_fungrp(fungrp_con, "G_C4"))
-c4_mod_dry <- lmer(fungrp_cov ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = scale_fungrp(fungrp_dry, "G_C4"))
-c4_mod_wet <- lmer(fungrp_cov ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = scale_fungrp(fungrp_wet, "G_C4"))
+#' Linear mixed models
+#' using rain_trt as a category
+C4_mod_cat <- lmer(fungrp_cov ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = scale_fungrp(fungrp_con, "G_C4"))
+  C4_cat_means <- emmeans(C4_mod_cat, specs = c("rain_trt", "graze_trt", "year")) 
+  C4_cat_contrasts <- C4_cat_means %>% 
+  contrast(method = 'pairwise', by = c("graze_trt", "year"), adjust = "none")
+
+#' using total precip cm 
+C4_mod_precip <- lmer(fungrp_cov ~ total_precip * graze_trt * year + (1|block) + (1|b_p), data = structure_precip) 
 
 #' Check residuals
-plot(c4_mod_con)
-qqnorm(residuals(c4_mod_con))
+plot(C4_mod_cat)
+qqnorm(residuals(C4_mod_cat))
 
 #' Model summaries
-anova(c4_mod_con)
-r2(c4_mod_con)
-summary(c4_mod_con)
-
-#' Extract fixed effects using reusable function
-c4_fixef_all <- bind_rows(extract_fixef(c4_mod_con, "c4"),
-  extract_fixef(c4_mod_dry, "c4"),
-  extract_fixef(c4_mod_wet, "c4")) %>%
-  distinct() %>%
-  arrange(term)
-c4_fixef_all
+anova(C4_mod_cat)
+r2(C4_mod_cat)
+summary(C4_mod_cat)
 
 #' C4 Grass Figure - generalized for all years
 c4_sum <- fungrp_sum %>%
@@ -792,12 +995,13 @@ fig_c4 <- ggplot(c4_sum, aes(x = year, y = mean, col = rain_trt, shape = graze_t
   geom_point(size = 2.5, alpha = 0.8, position = position_dodge(0.35)) +
   geom_errorbar(aes(ymin = mean - se, ymax = mean + se), linewidth = 1, width = 0, alpha = 0.45, position = position_dodge(0.35)) +
   scale_x_continuous(breaks = all_years, limits = c(min(all_years) - 0.25, max(all_years) + 0.25)) +
-  scale_color_manual(values = c("#d7191c", "#8856a7", "#2c7bb6"), labels = c("Drought", "Control", "Wet")) +
+  scale_color_manual(values = c("#d7191c", "tan", "#2c7bb6"), labels = c("Drought", "Control", "Wet")) +
   scale_shape_manual(values = c(16, 17, 15), labels = c("Ungrazed", "Fall Graze", "Spring Graze")) +
   labs(x = "Year", y = "C4 Perennial Grasses\n(rel. cover proportion)", col = "Rain Treatment", shape = "Graze Treatment") +
   facet_wrap(~graze_trt) +
+  coord_cartesian(ylim = c(-0, 1)) +
   theme_bw() +
-  theme(legend.position = "none",
+  theme(legend.position = "right",
         panel.grid.minor.x = element_blank(),
         axis.title.y = element_text(size = 10),
         axis.text.x = element_text(angle = 45, hjust = 1))
@@ -824,26 +1028,24 @@ scale_fungrp(fungrp_con, "G_C3") %>%
   facet_grid(year ~ graze_trt, scales = "free") +
   theme_bw()
 
-#' Models
-c3_mod_con <- lmer(fungrp_cov ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = scale_fungrp(fungrp_con, "G_C3"))
-c3_mod_dry <- lmer(fungrp_cov ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = scale_fungrp(fungrp_dry, "G_C3"))
-c3_mod_wet <- lmer(fungrp_cov ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = scale_fungrp(fungrp_wet, "G_C3"))
+#' Linear mixed models
+#' using rain_trt as a category
+C3_mod_cat <- lmer(fungrp_cov ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = scale_fungrp(fungrp_con, "G_C4"))
+C3_cat_means <- emmeans(C3_mod_cat, specs = c("rain_trt", "graze_trt", "year")) 
+C3_cat_contrasts <- C3_cat_means %>% 
+  contrast(method = 'pairwise', by = c("graze_trt", "year"), adjust = "none")
+
+#' using total precip cm 
+C3_mod_precip <- lmer(fungrp_cov ~ total_precip * graze_trt * year + (1|block) + (1|b_p), data = structure_precip) 
 
 #' Check residuals
-plot(c3_mod_con)
-qqnorm(residuals(c3_mod_con))
+plot(C3_mod_cat)
+qqnorm(residuals(C3_mod_cat))
 
 #' Model summaries
-anova(c3_mod_con)
-r2(c3_mod_con)
-summary(c3_mod_con)
-
-#' Extract fixed effects
-c3_fixef_all <- bind_rows(extract_fixef(c3_mod_con, "c3"),
-  extract_fixef(c3_mod_dry, "c3"),extract_fixef(c3_mod_wet, "c3")) %>%
-  distinct() %>%
-  arrange(term)
-c3_fixef_all
+anova(C3_mod_cat)
+r2(C3_mod_cat)
+summary(C3_mod_cat)
 
 # Summary dataframe for figure
 c3_sum <- fungrp_sum %>%
@@ -861,10 +1063,11 @@ fig_c3 <- ggplot(c3_sum, aes(x = year, y = mean, col = rain_trt, shape = graze_t
   geom_point(size = 2.5, alpha = 0.8, position = position_dodge(0.35)) +
   geom_errorbar(aes(ymin = mean - se, ymax = mean + se), linewidth = 1, width = 0, alpha = 0.45, position = position_dodge(0.35)) +
   scale_x_continuous(breaks = all_years, limits = c(min(all_years) - 0.25, max(all_years) + 0.25)) +
-  scale_color_manual(values = c("#d7191c", "#8856a7", "#2c7bb6"), labels = c("Drought", "Control", "Wet")) +
+  scale_color_manual(values = c("#d7191c", "tan", "#2c7bb6"), labels = c("Drought", "Control", "Wet")) +
   scale_shape_manual(values = c(16, 17, 15), labels = c("Ungrazed", "Fall Graze", "Spring Graze")) +
   labs(x = "Year", y = "C3 Perennial Grasses\n(rel. cover proportion)", col = "Rain Treatment", shape = "Graze Treatment") +
   facet_wrap(~graze_trt) +
+  coord_cartesian(ylim = c(-1.5, 1.5)) +
   theme_bw() +
   theme(legend.position = "none",
         panel.grid.minor.x = element_blank(),
@@ -960,10 +1163,11 @@ fig_ann <- ggplot(ann_sum_out, aes(x = year, y = mean, col = rain_trt, shape = g
   geom_point(size = 2.5, alpha = 0.8, position = position_dodge(0.35)) +
   geom_errorbar(aes(ymin = mean - se, ymax = mean + se), linewidth = 1, width = 0, alpha = 0.45, position = position_dodge(0.35)) +
   scale_x_continuous(breaks = all_years, limits = c(min(all_years) - 0.25, max(all_years) + 0.25)) +
-  scale_color_manual(values = c("#d7191c", "#8856a7", "#2c7bb6"), labels = c("Drought", "Control", "Wet")) +
+  scale_color_manual(values = c("#d7191c", "tan", "#2c7bb6"), labels = c("Drought", "Control", "Wet")) +
   scale_shape_manual(values = c(16, 17, 15), labels = c("Ungrazed", "Fall Graze", "Spring Graze")) +
   labs(x = "Year", y = "Annual-Biennials\n(rel. cover proportion)", col = "Rain Treatment", shape = "Graze Treatment") +
   facet_wrap(~graze_trt) +
+  coord_cartesian(ylim = c(-1.5, 1.5)) +
   theme_bw() +
   theme(legend.position = "none",
         panel.grid.minor.x = element_blank(),
@@ -997,22 +1201,25 @@ f_mod_con <- lmer(fungrp_cov ~ rain_trt * graze_trt * year + (1|block) + (1|b_p)
 f_mod_dry <- lmer(fungrp_cov ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = scale_fungrp(fungrp_dry, "F"))
 f_mod_wet <- lmer(fungrp_cov ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = scale_fungrp(fungrp_wet, "F"))
 
+#' Linear mixed models
+#' using rain_trt as a category
+f_mod_cat <- lmer(fungrp_cov ~ rain_trt * graze_trt * year + (1|block) + (1|b_p), data = scale_fungrp(fungrp_con, "G_C4"))
+f_cat_means <- emmeans(f_mod_cat, specs = c("rain_trt", "graze_trt", "year")) 
+f_cat_contrasts <- f_cat_means %>% 
+  contrast(method = 'pairwise', by = c("graze_trt", "year"), adjust = "none")
+
+#' using total precip cm 
+f_mod_precip <- lmer(fungrp_cov ~ total_precip * graze_trt * year + (1|block) + (1|b_p), data = structure_precip) 
+
 #' Check residuals
-plot(f_mod_con)
-qqnorm(residuals(f_mod_con))
+plot(f_mod_cat)
+qqnorm(residuals(f_mod_cat))
 
 #' Model summaries
-Anova(f_mod_con)
-anova(f_mod_con)
-r2(f_mod_con)
-summary(f_mod_con)
-
-#' Extract fixed effects
-f_fixef_all <- bind_rows(extract_fixef(f_mod_con, "f"),
-  extract_fixef(f_mod_dry, "f"), extract_fixef(f_mod_wet, "f")) %>%
-  distinct() %>%
-  arrange(term)
-f_fixef_all
+Anova(f_mod_cat)
+anova(f_mod_cat)
+r2(f_mod_cat)
+summary(f_mod_cat)
 
 # Summary dataframe
 f_sum <- fungrp_sum %>%
@@ -1030,10 +1237,11 @@ fig_forb <- ggplot(f_sum, aes(x = year, y = mean, col = rain_trt, shape = graze_
      geom_point(size = 2.5, alpha = 0.8, position = position_dodge(0.35)) +
   geom_errorbar(aes(ymin = mean - se, ymax = mean + se), linewidth = 1, width = 0, alpha = 0.45, position = position_dodge(0.35)) +
   scale_x_continuous(breaks = all_years, limits = c(min(all_years) - 0.25, max(all_years) + 0.25)) +
-  scale_color_manual(values = c("#d7191c", "#8856a7", "#2c7bb6"), labels = c("Drought", "Control", "Wet")) +
+  scale_color_manual(values = c("#d7191c", "tan", "#2c7bb6"), labels = c("Drought", "Control", "Wet")) +
   scale_shape_manual(values = c(16, 17, 15), labels = c("Ungrazed", "Fall Graze", "Spring Graze")) +
   labs(x = "Year", y = "Perennial Forbs\n(rel. cover proportion)", col = "Rain Treatment", shape = "Graze Treatment") +
   facet_wrap(~graze_trt) +
+  coord_cartesian(ylim = c(-1.5, 1.5)) +
   theme_bw() +
   theme(legend.position = "none",
         panel.grid.minor.x = element_blank(),
@@ -1046,17 +1254,296 @@ ggsave(fig_forb, filename = paste0(wdpath, "Figures26/fig_forb.jpg"),
        device = "jpeg", height = 4.64, width = 6.5, units = "in")
 
 
+#' 
+#' *Combined figure for C4, C3, annuals, forbs*
 
+#' Combined figure: diversity richness, evenness, 
+fig_combined_43af <- (fig_c4 + fig_c3) / (fig_ann + fig_forb) +
+  plot_annotation(title = "Community Composition", tag_levels = "A") + 
+  plot_layout(guides = "collect", axis_titles = "collect")
 
+#' view and save
+fig_combined_43af
+ggsave(fig_combined_43af, filename = paste0(wdpath, "Figures26/fig_combined_43af.jpg"),
+       device = "jpeg", height = 10, width = 10, units = "in")
 
+#' 
+#' ** Supporting data figure: Absolute relative covers for each functional groups**
+#' 
+fg_abs_full_allyears <- fungrp_df %>%
+  pivot_wider(names_from = fun_grp, 
+              values_from = fungrp_cov,
+              values_fill = 0) %>%
+  rename_with(~ paste0(tolower(gsub("G_", "", .)), "_abs"), 
+              .cols = -c(year, b_p, block, rain_trt, graze_trt)) %>%
+  #removes outlier
+  mutate(across(contains("ann"), ~ if_else(b_p == "3_4", NA_real_, .)))
 
+fg_abs_sum_dat <- fg_abs_full_allyears %>%
+  #mutate(ann_abs = if_else(b_p == "3_4", NA_real_, ann_abs)) %>%
+  pivot_longer(cols = c4_abs:f_abs, names_to = "fg", values_to = "abs_cov") %>%
+  group_by(fg, year, graze_trt, rain_trt) %>%
+  summarise(abs_cov_mean = mean(abs_cov, na.rm = TRUE),
+            abs_cov_se   = se(abs_cov, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(year = as.numeric(as.character(year)), rain_trt = factor(rain_trt, levels = c("D", "C", "W")),
+    graze_trt = fct_recode(as.character(graze_trt), "Ungrazed" = "C", "Fall Graze" = "FG", "Spring Graze" = "SG") %>%
+    factor(levels = c("Ungrazed", "Fall Graze", "Spring Graze")),
+    fg = fct_recode(fg, "Annual-Biennials" = "ann_abs", "C3 Perennial Grasses" = "c3_abs",
+                    "C4 Perennial Grasses" = "c4_abs", "Perennial Forbs" = "f_abs") %>%
+    factor(levels = c("Annual-Biennials", "Perennial Forbs", "C3 Perennial Grasses", "C4 Perennial Grasses")))
 
+fig_fg_abs <- ggplot(fg_abs_sum_dat, 
+                     aes(x = year, y = abs_cov_mean, 
+                         col = rain_trt, shape = graze_trt)) +
+  geom_point(size = 2.5, alpha = 0.8, position = position_dodge(0.35)) +
+  geom_errorbar(aes(ymin = abs_cov_mean - abs_cov_se, 
+                    ymax = abs_cov_mean + abs_cov_se),
+                linewidth = 1, width = 0, alpha = 0.45,    # linewidth not size
+                position = position_dodge(0.35)) +
+  scale_x_continuous(breaks = all_years,                   # dynamic
+                     limits = c(min(all_years) - 0.25, 
+                                max(all_years) + 0.25)) +
+  scale_color_manual(values = c("#d7191c", "tan", "#2c7bb6")) +
+  scale_fill_manual(values  = c("#d7191c", "tan", "#2c7bb6")) +
+  labs(x = "Year", y = "Absolute Cover (%)", 
+       col = "Rain trt.", shape = "Graze trt.") +
+  facet_grid(fg ~ graze_trt, scales = "free") +
+  theme_bw() +
+  theme(panel.grid.minor.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
 
+fig_fg_abs
 
+#' 
+#' *species richness X precip figure*
+precipRich <- precip_annual %>%
+  #left_join(treatments, by = c("block", "plot")) %>% 
+  left_join(structure_sum_rich, by = c("year", "rain_trt"))
 
+fig_precipRich <- ggplot(precipRich, aes(x = as.factor(year))) +
+  geom_bar(aes(y = total_precip, fill = rain_trt, group = rain_trt),
+           stat = "identity", width = 0.35, position = position_dodge(0.4), alpha = 0.3) +
+  geom_point(aes(y = mean * max(total_precip, na.rm = TRUE) / 30, 
+                 col = rain_trt, shape = graze_trt), size = 2.5, alpha = 0.8, position = position_dodge(0.4)) +
+  geom_errorbar(aes(ymin = (mean - se) * max(total_precip, na.rm = TRUE) / 30,  
+                    ymax = (mean + se) * max(total_precip, na.rm = TRUE) / 30,
+                    group = rain_trt), linewidth = 1, width = 0, alpha = 0.45, position = position_dodge(0.4)) +  
+  scale_y_continuous(name = "Total Precipitation (cm)", limits = c(0, NA),  # force y to start at 0
+    sec.axis = sec_axis(~ . / max(precipRich$total_precip, na.rm = TRUE) * 30, name = "Species Richness")) +
+  scale_fill_manual(values  = c("#d7191c", "tan", "#2c7bb6"), labels  = c("Drought", "Control", "Wet")) +
+  scale_color_manual(values = c("#d7191c", "tan", "#2c7bb6"), labels = c("Drought", "Control", "Wet")) +
+  scale_shape_manual(values = c(16, 17, 15), labels = c("Ungrazed", "Fall Graze", "Spring Graze")) +
+  labs(x = "Year", fill = "Rain Treatment", col = "Rain Treatment", shape = "Graze Treatment") +
+  facet_wrap(~graze_trt) +
+  theme_bw() +
+  theme(legend.position = "right",
+        panel.grid.minor.x = element_blank(),
+        axis.title.y = element_text(size = 10), 
+        axis.text.x = element_text(angle = 45, hjust = 1))
 
+fig_precipRich
 
+precipRich2 <- precipRich %>% 
+  group_by(rain_trt, graze_trt)
 
+fig_precipRich2 <- ggplot(precipRich2, aes(x = total_precip, y = mean, col = rain_trt, shape = graze_trt)) + 
+  geom_point(size = 2.5, alpha = 0.8, position = position_dodge(0.35)) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), linewidth = 1, width = 0, alpha = 0.45, position = position_dodge(0.35)) +
+  scale_x_continuous(limits = c(0, max(precipRich2$total_precip) + 0.25)) +
+  scale_color_manual(values = c("#d7191c", "tan", "#2c7bb6"), labels = c("Drought", "Control", "Wet")) +
+  scale_shape_manual(values = c(16, 17, 15), labels = c("Ungrazed", "Fall Graze", "Spring Graze")) +
+  labs(x = "Precipitation (cm)", y = "Species Richness", col = "Rain Treatment", shape = "Graze Treatment") +
+  facet_wrap(~graze_trt) +
+  theme_bw() +
+  theme(legend.position = "right",
+        panel.grid.minor.x = element_blank(),
+        axis.title.y = element_text(size = 10))
 
+fig_precipRich2
 
+fig_combined_precipRich <- fig_precipRich / fig_precipRich2 +
+  plot_annotation(title = "Precipitation and Species Richness", tag_levels = "A") + 
+  plot_layout(guides = "collect")
 
+fig_combined_precipRich
+
+#' 
+#' *Species Diversity X precip figure*
+precipDiv <- precip_annual %>%
+  #left_join(treatments, by = c("block", "plot")) %>% 
+  left_join(structure_sum_div, by = c("year", "rain_trt"))
+
+fig_precipDiv <- ggplot(precipDiv, aes(x = as.factor(year))) +
+  geom_bar(aes(y = total_precip, fill = rain_trt, group = rain_trt),
+           stat = "identity", width = 0.35, position = position_dodge(0.4), alpha = 0.3) +
+  #geom_point(aes(y = mean * max(total_precip, na.rm = TRUE) / 3, 
+  #col = rain_trt, shape = graze_trt), size = 2.5, alpha = 0.8, position = position_dodge(0.4)) +
+  geom_point(aes(y = mean, col = rain_trt, shape = graze_trt), size = 2.5, alpha = 0.8, position = position_dodge(0.4)) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), linewidth = 1, width = 0, alpha = 0.45, position = position_dodge(0.4)) +
+  #geom_errorbar(aes(ymin = (mean - se) * max(total_precip, na.rm = TRUE) / 3,  
+                    #ymax = (mean + se) * max(total_precip, na.rm = TRUE) / 3,
+                    #group = rain_trt), linewidth = 1, width = 0, alpha = 0.45, position = position_dodge(0.4)) +  
+  scale_y_continuous(name = "Shannon Diversity", 
+                     sec.axis = sec_axis(limits = c(0, ~ . /max(precipDiv$mean, na.rm = T)) * 100, name = "Total Precipitation (cm)")) +
+  #scale_y_continuous(name = "Total Precipitation (cm)", limits = c(0, NA),  
+                     #sec.axis = sec_axis(~ . / max(precipDiv$total_precip, na.rm = TRUE) * 3, name = "Shannon Diversity")) +
+  scale_fill_manual(values  = c("#d7191c", "tan", "#2c7bb6"), labels  = c("Drought", "Control", "Wet")) +
+  scale_color_manual(values = c("#d7191c", "tan", "#2c7bb6"), labels = c("Drought", "Control", "Wet")) +
+  scale_shape_manual(values = c(16, 17, 15), labels = c("Ungrazed", "Fall Graze", "Spring Graze")) +
+  labs(x = "Year", fill = "Rain Treatment", col = "Rain Treatment", shape = "Graze Treatment") +
+  facet_wrap(~graze_trt) +
+  theme_bw() +
+  theme(legend.position = "right",
+        panel.grid.minor.x = element_blank(),
+        axis.title.y = element_text(size = 10), 
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 1. Calculate a scaling factor
+# This ensures the max precip aligns with the top of your diversity scale
+scaleFactor_precipDiv <- max(precipDiv$total_precip, na.rm = TRUE) / max(precipDiv$mean, na.rm = TRUE)
+
+fig_precipDiv <- ggplot(precipDiv, aes(x = as.factor(year))) +
+  geom_bar(aes(y = total_precip / scaleFactor_precipDiv, fill = rain_trt),
+           stat = "identity", width = 0.35, position = position_dodge(0.4), alpha = 0.3) +
+  geom_point(aes(y = mean, col = rain_trt, shape = graze_trt), 
+             size = 2.5, alpha = 0.8, position = position_dodge(0.4)) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se, group = rain_trt), 
+                linewidth = 1, width = 0, alpha = 0.45, position = position_dodge(0.4)) +
+    scale_y_continuous(name = "Shannon Diversity", limits = c(0, NA),  
+    sec.axis = sec_axis(~ . * scaleFactor_precipDiv, name = "Total Precipitation (cm)")) +
+  scale_fill_manual(values = c("#d7191c", "tan", "#2c7bb6"), labels = c("Drought", "Control", "Wet")) +
+  scale_color_manual(values = c("#d7191c", "tan", "#2c7bb6"), labels = c("Drought", "Control", "Wet")) +
+  scale_shape_manual(values = c(16, 17, 15), labels = c("Ungrazed", "Fall Graze", "Spring Graze")) +
+  labs(x = "Year", fill = "Rain Treatment", col = "Rain Treatment", shape = "Graze Treatment") +
+  facet_wrap(~graze_trt) +
+  theme_bw() +
+  theme(legend.position = "right",
+        panel.grid.minor.x = element_blank(),
+        axis.title.y = element_text(size = 10), 
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+fig_precipDiv
+
+precipDiv2 <- precipDiv %>% 
+  group_by(rain_trt, graze_trt)
+
+fig_precipDiv2 <- ggplot(precipDiv2, aes(x = total_precip, y = mean, col = rain_trt, shape = graze_trt)) + 
+  geom_point(aes(alpha = year), size = 2.5, position = position_dodge(0.35)) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), linewidth = 1, width = 0, alpha = 0.45, position = position_dodge(0.35)) +
+  scale_x_continuous(limits = c(0, max(precipDiv2$total_precip) + 0.25)) +
+  scale_color_manual(values = c("#d7191c", "tan", "#2c7bb6"), labels = c("Drought", "Control", "Wet")) +
+  scale_shape_manual(values = c(16, 17, 15), labels = c("Ungrazed", "Fall Graze", "Spring Graze")) +
+  labs(x = "Precipitation (cm)", y = "Shannon Diversity", col = "Rain Treatment", shape = "Graze Treatment") +
+  facet_wrap(~graze_trt) +
+  theme_bw() +
+  theme(legend.position = "right",
+        panel.grid.minor.x = element_blank(),
+        axis.title.y = element_text(size = 10))
+
+fig_precipDiv2
+
+fig_combined_precipDiv <- fig_precipDiv / fig_precipDiv2 +
+  plot_annotation(title = "Precipitation and Shannon Diversity", tag_levels = "A") + 
+  plot_layout(guides = "collect")
+
+fig_combined_precipDiv
+
+#' 
+#' *precipitation X c3 cover Figure*
+precipC3 <- precip_annual %>%
+  #left_join(treatments, by = c("block", "plot")) %>% 
+  left_join(c3_sum, by = c("year", "rain_trt"))
+
+fig_precipC3 <- ggplot(precipC3, aes(x = total_precip, y = mean, col = rain_trt, shape = graze_trt)) +
+  geom_text(aes(label = year), size = 3, vjust = -1)  +
+  geom_point(aes(size = year), position = position_dodge(0.35)) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), linewidth = 1, width = 0, alpha = 0.45, position = position_dodge(0.35)) +
+  scale_x_continuous(limits = c(0, max(precipDiv2$total_precip) + 0.25)) +
+  scale_color_manual(values = c("#d7191c", "tan", "#2c7bb6"), labels = c("Drought", "Control", "Wet")) +
+  scale_shape_manual(values = c(16, 17, 15), labels = c("Ungrazed", "Fall Graze", "Spring Graze")) +
+  labs(x = "Total Precipitation (cm)", y = "C3 Perennial Grasses\n(rel. cover proportion)", col = "Rain Treatment", shape = "Graze Treatment") +
+  facet_wrap(~graze_trt) +
+  #coord_cartesian(ylim = c(-1.5, 1.5)) +
+  theme_bw() +
+  theme(legend.position = "right",
+        panel.grid.minor.x = element_blank(),
+        axis.title.y = element_text(size = 10),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+fig_precipC3
+
+#' 
+#' *precipitation X c4 cover Figure*
+precipC4 <- precip_annual %>%
+  #left_join(treatments, by = c("block", "plot")) %>% 
+  left_join(c4_sum, by = c("year", "rain_trt"))
+
+fig_precipC4 <- ggplot(precipC4, aes(x = total_precip, y = mean, col = rain_trt, shape = graze_trt, group = interaction(rain_trt, graze_trt))) +
+  geom_text(aes(label = year), size = 3, vjust = -1)  +
+  geom_point(aes(size = year), position = position_dodge(0.35)) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), linewidth = 1, width = 0, alpha = 0.45, position = position_dodge(0.35)) +
+  scale_x_continuous(limits = c(0, max(precipDiv2$total_precip) + 0.25)) +
+  scale_color_manual(values = c("#d7191c", "tan", "#2c7bb6"), labels = c("Drought", "Control", "Wet")) +
+  scale_shape_manual(values = c(16, 17, 15), labels = c("Ungrazed", "Fall Graze", "Spring Graze")) +
+  labs(x = "Total Precipitation (cm)", y = "C4 Perennial Grasses\n(rel. cover proportion)", col = "Rain Treatment", shape = "Graze Treatment") +
+  facet_wrap(~graze_trt) +
+  #coord_cartesian(ylim = c(-1.5, 1.5)) +
+  theme_bw() +
+  theme(legend.position = "right",
+        panel.grid.minor.x = element_blank(),
+        axis.title.y = element_text(size = 10),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+fig_precipC4
+
+fig_combined_precipC3C4 <- fig_precipC3 / fig_precipC4 +
+  plot_annotation(title = "Precipitation and Relative Proportions of C3 and C4 Perennial Grasses", tag_levels = "A") + 
+  plot_layout(guides = "collect")
+
+fig_combined_precipC3C4
+
+#####
+#'    
+#'    
+#'    
+#'    [Part 2] : *FORAGE SERVICES RESPONSES*
+#'                   to rainfall and grazing interactions
+#'  
+#'  
+#'  [A] : Compile raw dataframes
+#'  
+#'  [B] : Prep model and figure dataframes
+#'  
+#'  [C] : Explore rainfall and grazing interactions on forage response
+#'  
+#'  [D] : Identify key indices of plant-driven functions and services
+#'  
+#'  
+#'  
+#'###         
+
+##
+#' 
+#' 
+#' [A]: **RAW DATA PREPARATION**
+#' 
+#'                Compile dataframes to assess rainfall and grazing effects on
+#'                     plant communities and services
+#' 
+#'
+#'##
+
+#'
+#'  **PLANT BIOMASS and BARE GROUND - Prep data**
+#'     
+
+#' 
+#' *Data preparation*
+#' 
+
+#' Load dataframe with plant biomass (production), bare ground, and counts for some annual species
+plant <- read.csv(paste0(wdpath, "Plant_Plot_Metrics_2018-23.csv"))
+
+#' View structure of data and remove sample_ID column
+str(plant)
